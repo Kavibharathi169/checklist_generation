@@ -184,5 +184,9 @@ async def chat_endpoint_stream(request: ChatRequest):
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 # Mount the custom HTML UI
-app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
+#app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
 
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)

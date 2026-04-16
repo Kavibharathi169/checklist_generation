@@ -32,4 +32,4 @@ EXPOSE 8501 8000
 
 # Provide a default command.
 # By default, we run the Streamlit app. For FastAPI, override in docker-compose.
-CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
