@@ -1,19 +1,22 @@
-# Use official Python image
+# Dockerfile for Governance AI - Document to Intelligent Checklist System
+
+# Use the official Python base image
 FROM python:3.11-slim
 
-# Prevent Python from writing .pyc files & enable unbuffered logs
+# Set environment variables to prevent Python from writing .pyc files to disk
+# and to ensure stdout/stderr is unbuffered
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Set working directory
+# Create and set the working directory
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies (e.g., for Trafilatura or python-docx if needed)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends gcc g++ \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first (for caching)
+# Copy requirements.txt first to leverage Docker cache
 COPY requirements.txt .
 
 # Install Python dependencies
@@ -21,11 +24,12 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir chromadb streamlit sentence-transformers
 
-# Copy project files
+# Copy the entire project directory into the container
 COPY . .
 
-# Expose Render's expected port
-EXPOSE 10000
+# Expose ports for Streamlit and FastAPI
+EXPOSE 8501 8000
 
-# Run Streamlit app (dynamic PORT support for Render)
-CMD ["sh", "-c", "streamlit run app.py --server.port=${PORT:-10000} --server.address=0.0.0.0"]
+# Provide a default command.
+# By default, we run the Streamlit app. For FastAPI, override in docker-compose.
+CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
