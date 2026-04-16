@@ -7,7 +7,7 @@ import os
 import uuid
 import pandas as pd
 
-API_URL = os.getenv("API_URL", "http://localhost:8000")
+API_URL = os.getenv("API_URL", "https://govlens-mdkg.onrender.com")
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
