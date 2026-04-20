@@ -1,0 +1,66 @@
+{
+    "domains": {
+        "board_governance": [
+            "board", "director", "chairman", "chairperson",
+            "quorum", "trustee", "governance", "committee",
+            "independent director", "board meeting",
+            "board composition", "fiduciary"
+        ],
+        "data_privacy": [
+            "privacy", "personal data", "gdpr", "consent",
+            "data protection", "personal information",
+            "data subject", "data controller", "data processor",
+            "right to erasure", "right to access",
+            "privacy policy", "confidentiality"
+        ],
+        "risk_management": [
+            "risk", "control", "appetite", "mitigation",
+            "risk management", "risk framework", "risk register",
+            "internal control", "risk assessment",
+            "risk tolerance", "risk appetite", "risk owner",
+            "enterprise risk"
+        ],
+        "audit_compliance": [
+            "audit", "compliance", "assurance",
+            "internal audit", "external audit",
+            "audit committee", "regulatory", "inspection",
+            "audit report", "audit findings", "compliance officer",
+            "sox", "internal controls over financial reporting"
+        ],
+        "shareholder_rights": [
+            "shareholder", "voting", "agm", "dividend",
+            "equity", "investor", "annual general meeting",
+            "shareholder rights", "proxy", "share",
+            "stockholder", "shareholder meeting",
+            "voting rights", "minority shareholder"
+        ],
+        "csr": [
+            "csr", "sustainability", "esg", "environment",
+            "carbon", "social responsibility", "climate",
+            "green", "renewable", "emission", "biodiversity",
+            "corporate social responsibility", "social impact",
+            "environmental policy"
+        ],
+        "hr_policy": [
+            "salary", "recruitment", "employee", "conduct",
+            "hr", "human resource", "compensation", "benefits",
+            "leave policy", "code of conduct", "workplace",
+            "staff", "personnel", "hiring", "termination",
+            "performance review", "training"
+        ],
+        "financial_compliance": [
+            "financial", "accounting", "ifrs", "gaap",
+            "disclosure", "revenue", "financial statement",
+            "balance sheet", "income statement", "cash flow",
+            "financial reporting", "tax", "budget",
+            "financial control", "treasury"
+        ]
+    },
+    "frameworks": {
+        "GDPR": ["gdpr", "general data protection"],
+        "ISO_27001": ["iso 27001", "iso27001", "information security management"],
+        "SOX": ["sox", "sarbanes-oxley", "sarbanes oxley"],
+        "SEBI": ["sebi", "securities and exchange board"],
+        "Companies_Act": ["companies act", "corporate law", "company act"]
+    }
+}

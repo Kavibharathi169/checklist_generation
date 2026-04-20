@@ -1,4 +1,4 @@
-﻿# GovCheck AI — Governance document to checklist
+# GovCheck AI — Governance document to checklist
 
 GovCheck ingests governance and compliance documents (PDF, Word, Excel, CSV, text, and web URLs), chunks and embeds them, and produces structured checklist items using a **hybrid RAG** stack (ChromaDB dense search + BM25). Data is scoped by `user_id` so sessions stay isolated in the vector store and BM25 corpus.
 
@@ -8,14 +8,15 @@ GovCheck ingests governance and compliance documents (PDF, Word, Excel, CSV, tex
 
 | Layer | Role |
 |--------|------|
-| **FastAPI (`main.py`)** | REST API: upload jobs, status polling, chat/stream. Serves the static web UI from `frontend/` at `/`. Uses background tasks for ingestion. |
+| **FastAPI (`main.py`)** | REST API: upload jobs, status polling, chat/stream. Serves the static web UI from `frontend/` at `/`. Enqueues ingestion jobs to Celery. |
+| **Queue / workers** | **Celery + Redis** handles ingestion asynchronously; job status is stored in Redis with TTL for reliable polling across restarts. |
 | **Streamlit (`app.py`)** | Optional dashboard: upload/poll, checklist table, domain filters, CSV/JSON/Excel export, RAG chat tab. Calls the API via `API_URL` (default `http://localhost:8000`). |
 | **Ingestion** | `ingestion/router.py` routes by file type or URL to loaders (PDF, DOCX, XLSX, CSV, scrape, etc.). |
-| **Chunking** | `chunking/chunker.py` uses **embedding-based semantic chunking** (paragraph units + cosine similarity boundaries) with a safe fallback to `RecursiveCharacterTextSplitter`; token sizing uses **tiktoken** (fallback if unavailable). Default chunk budget aligns with **multilingual-e5** (~512 tokens). |
+| **Chunking** | `chunking/chunker.py` merges blocks and splits with `RecursiveCharacterTextSplitter`; token sizing uses **tiktoken** (fallback if unavailable). Default chunk budget aligns with **multilingual-e5** (~512 tokens). |
 | **Classification** | `classification/rule_classifier.py`: keyword rules first; optional **Groq** per-chunk fallback when `CLASSIFY_USE_LLM=true` (default is off for speed). |
 | **Embeddings** | `embedding/embedder.py`: **sentence-transformers** (default `intfloat/multilingual-e5-base`), `passage:` / `query:` prefixes for E5. |
 | **Stores** | **ChromaDB** (`vectorstore/chroma_store.py`) + **BM25** (`retrieval/bm25_store.py` via `rank-bm25`), per-user on disk under `OUTPUT_DIR`. |
-| **LLM** | **Groq** (`llm/`) for checklist JSON and Q&A; prompts stress grounding in retrieved context. |
+| **LLM** | Provider router in `llm/`: **Groq** (default) or **PicoClaw** (set `LLM_PROVIDER=picoclaw`) for checklist JSON and Q&A. |
 
 ---
 
@@ -61,8 +62,11 @@ Interactive docs: **http://127.0.0.1:8000/docs**
 Copy `.env.example` to `.env` and set at least:
 
 ```env
+LLM_PROVIDER=groq
 GROQ_API_KEY=your_key_here
 GROQ_GENERATOR_MODEL=llama-3.3-70b-versatile
+PICOCLAW_API_KEY=your_picoclaw_key_here
+PICOCLAW_AGENTIC_ENABLED=false
 EMBEDDING_MODEL=intfloat/multilingual-e5-base
 CHROMA_PERSIST_DIR=./chroma_db
 OUTPUT_DIR=./output
@@ -75,18 +79,15 @@ API_URL=http://localhost:8000          # Streamlit → API
 CLASSIFY_USE_LLM=false                  # true = Groq per chunk when rules miss (slower)
 CLASSIFY_DEFAULT_DOMAIN=audit_compliance
 CHUNK_MAX_TOKENS=512
-CHUNK_OVERLAP=128
-SEMANTIC_SIM_THRESHOLD=0.70
-SEMANTIC_MIN_TOKENS=128
-VERIFY_ENABLE=true
-VERIFY_MIN_CONFIDENCE=0.80
-RERANK_ENABLE=false
-RERANK_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
-RERANK_CANDIDATE_MULTIPLIER=2
-RETRIEVAL_FETCH_MULTIPLIER=3
+CHUNK_OVERLAP=64
 EMBEDDING_BATCH_SIZE=192
 TORCH_NUM_THREADS=8                     # CPU only, optional
 SAVE_CHUNK_JSONL=false                  # true = append chunks to output/chunked.jsonl
+REDIS_URL=redis://localhost:6379/0
+CELERY_BROKER_URL=redis://localhost:6379/0
+CELERY_RESULT_BACKEND=redis://localhost:6379/0
+CELERY_MAX_TASKS_PER_CHILD=20           # memory-safety worker recycle threshold
+JOB_STATUS_TTL_SECONDS=86400            # status record retention
 ```
 
 ### 2. Install dependencies
@@ -109,9 +110,13 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-`requirements.txt` includes **FastAPI**, **chromadb**, **sentence-transformers**, **streamlit**, **rank-bm25**, **groq**, and ingestion libraries. First embedding model load may download weights from Hugging Face.
+`requirements.txt` includes **FastAPI**, **chromadb**, **sentence-transformers**, **streamlit**, **rank-bm25**, **groq**, **picoclaw**, and ingestion libraries. First embedding model load may download weights from Hugging Face.
 
-### 3. Run (two terminals)
+Set `PICOCLAW_AGENTIC_ENABLED=true` with `LLM_PROVIDER=picoclaw` to enable a lightweight agentic loop (`plan -> execute -> verify -> revise`) for checklist and Q&A generation.
+The generator also applies anti-hallucination guards: answers must include valid `[chunk_id:<id>]` citations, and checklist items without grounding to retrieved chunks are dropped.
+Checklist output quality is hardened with schema-locked prompting, normalization (`priority`, `action_type`), evidence cleanup, deduplication, and deterministic ranking by priority + retrieval score.
+
+### 3. Run (three terminals)
 
 **Terminal 1 — API**
 
@@ -124,6 +129,14 @@ python -m uvicorn main:app --host 127.0.0.1 --port 8000
 ```bash
 streamlit run app.py --server.port 8501 --server.address 127.0.0.1
 ```
+
+**Terminal 3 — Celery worker**
+
+```bash
+celery -A workers.celery_app.celery_app worker --loglevel=info --concurrency=1
+```
+
+Redis must be running before starting API/worker (local default: `redis-server`).
 
 - **Streamlit:** http://127.0.0.1:8501  
 - **Static UI + API:** http://127.0.0.1:8000  

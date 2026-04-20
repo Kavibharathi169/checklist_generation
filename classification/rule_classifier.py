@@ -1,5 +1,6 @@
 import logging
 import os
+import json
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -8,9 +9,10 @@ logger = logging.getLogger(__name__)
 USE_LLM_DOMAIN = os.getenv("CLASSIFY_USE_LLM", "false").lower() in ("1", "true", "yes")
 FAST_DOMAIN_DEFAULT = os.getenv("CLASSIFY_DEFAULT_DOMAIN", "audit_compliance")
 _CLASSIFY_WORKERS = max(1, min(16, int(os.getenv("CLASSIFY_MAX_WORKERS", "8"))))
+CLASSIFY_CONFIG_PATH = os.getenv("CLASSIFY_CONFIG_PATH", "config/classification.json")
 
 # ── Keyword map ───────────────────────────────────────────────
-KEYWORD_MAP: dict[str, list[str]] = {
+DEFAULT_KEYWORD_MAP: dict[str, list[str]] = {
     "board_governance": [
         "board", "director", "chairman", "chairperson",
         "quorum", "trustee", "governance", "committee",
@@ -69,7 +71,7 @@ KEYWORD_MAP: dict[str, list[str]] = {
 }
 
 # ── Compliance framework keyword map ─────────────────────────
-FRAMEWORK_MAP: dict[str, list[str]] = {
+DEFAULT_FRAMEWORK_MAP: dict[str, list[str]] = {
     "GDPR"          : ["gdpr", "general data protection"],
     "ISO_27001"     : ["iso 27001", "iso27001",
                        "information security management"],
@@ -79,6 +81,29 @@ FRAMEWORK_MAP: dict[str, list[str]] = {
     "Companies_Act" : ["companies act", "corporate law",
                        "company act"],
 }
+
+KEYWORD_MAP = DEFAULT_KEYWORD_MAP.copy()
+FRAMEWORK_MAP = DEFAULT_FRAMEWORK_MAP.copy()
+
+def _load_classification_config():
+    global KEYWORD_MAP, FRAMEWORK_MAP
+    if os.path.exists(CLASSIFY_CONFIG_PATH):
+        try:
+            with open(CLASSIFY_CONFIG_PATH, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            if "domains" in config:
+                KEYWORD_MAP = config["domains"]
+            if "frameworks" in config:
+                FRAMEWORK_MAP = config["frameworks"]
+            logger.info(f"Loaded dynamic classification rules from {CLASSIFY_CONFIG_PATH}")
+        except Exception as e:
+            logger.error(f"Failed to load classification config from {CLASSIFY_CONFIG_PATH}: {e}")
+
+_load_classification_config()
+
+def get_valid_domains() -> list[str]:
+    """Return the list of currently configured valid domains."""
+    return list(KEYWORD_MAP.keys())
 
 # ── Japanese corporate TLDs ───────────────────────────────────
 JAPANESE_TLDS = [".co.jp", ".or.jp", ".ne.jp", ".go.jp"]

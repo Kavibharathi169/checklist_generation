@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import pickle
+import re
 from rank_bm25 import BM25Okapi
 
 logger = logging.getLogger(__name__)
@@ -13,7 +14,10 @@ _bm25_cache = {}
 _corpus_cache = {}
 
 def tokenize(text: str) -> list[str]:
-    return text.lower().split()
+    if not text:
+        return []
+    # Keep alphanumerics and common compliance separators.
+    return re.findall(r"[a-z0-9][a-z0-9_\-./]*", text.lower())
 
 def get_user_paths(user_id: str):
     user_dir = os.path.join(OUTPUT_DIR, user_id)
@@ -38,9 +42,22 @@ def build_bm25_index(chunks: list[dict], user_id: str = "anonymous"):
         except Exception:
             user_corpus = []
 
-    # Append new chunks
-    new_corpus = [{"id": c["chunk_id"], "text": c["text"], "metadata": c} for c in chunks]
-    user_corpus.extend(new_corpus)
+    # Deduplicate existing corpus by chunk id before appending.
+    dedup_map = {}
+    for doc in user_corpus:
+        doc_id = str(doc.get("id", ""))
+        if doc_id:
+            dedup_map[doc_id] = doc
+
+    # Upsert new chunks by chunk_id.
+    for c in chunks:
+        chunk_id = str(c.get("chunk_id", ""))
+        text = str(c.get("text", ""))
+        if not chunk_id or not text.strip():
+            continue
+        dedup_map[chunk_id] = {"id": chunk_id, "text": text, "tokens": tokenize(text), "metadata": c}
+
+    user_corpus = list(dedup_map.values())
 
     # Save corpus
     with open(corpus_path, "w", encoding="utf-8") as f:
@@ -53,7 +70,27 @@ def build_bm25_index(chunks: list[dict], user_id: str = "anonymous"):
         _corpus_cache[user_id] = []
         return
 
-    tokenized_corpus = [tokenize(doc["text"]) for doc in user_corpus]
+    tokenized_corpus = []
+    has_new_tokens = False
+    for doc in user_corpus:
+        tokens = doc.get("tokens")
+        if tokens is None:
+            tokens = tokenize(doc.get("text", ""))
+            doc["tokens"] = tokens
+            has_new_tokens = True
+        tokenized_corpus.append(tokens)
+
+    # Save corpus after tokenization to cache missing tokens
+    if has_new_tokens:
+        with open(corpus_path, "w", encoding="utf-8") as f:
+            json.dump(user_corpus, f, ensure_ascii=False)
+
+    if not any(tokenized_corpus):
+        logger.warning(f"BM25 corpus for {user_id} has no valid tokens.")
+        _bm25_cache[user_id] = None
+        _corpus_cache[user_id] = user_corpus
+        return
+
     user_bm25 = BM25Okapi(tokenized_corpus)
 
     # Save index
@@ -100,6 +137,9 @@ def search_bm25(query: str, top_k: int = 5, user_id: str = "anonymous") -> list[
         return []
 
     tokenized_query = tokenize(query)
+    if not tokenized_query:
+        return []
+
     doc_scores = user_bm25.get_scores(tokenized_query)
 
     # Get top-k indices
@@ -109,3 +149,10 @@ def search_bm25(query: str, top_k: int = 5, user_id: str = "anonymous") -> list[
     for idx in top_indices:
         if doc_scores[idx] > 0:  # Only add if there's actually a keyword match
             doc = user_corpus[idx]
+            results.append({
+                "chunk_id": doc.get("id", ""),
+                "text": doc.get("text", ""),
+                "metadata": doc.get("metadata", {}),
+                "score": float(doc_scores[idx]),
+            })
+    return results

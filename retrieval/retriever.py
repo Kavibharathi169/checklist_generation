@@ -11,32 +11,15 @@ logger = logging.getLogger(__name__)
 # ALPHA = 0.7 means 70% Vector and 30% Keyword importance.
 # Higher Alpha = better for conceptual questions ("What are the duties?")
 # Lower Alpha = better for exact matches ("Section 3.2.1", "ISO 27001")
-ALPHA = float(os.getenv("SEARCH_WEIGHT_ALPHA", "0.7"))
+ALPHA = max(0.0, min(1.0, float(os.getenv("SEARCH_WEIGHT_ALPHA", "0.7"))))
+RRF_K = int(os.getenv("SEARCH_RRF_K", "60"))
 
 # Cross-encoder re-ranking disabled — requires a separate model download
 # and blocks first query. Hybrid BM25+vector scoring is sufficient.
-_reranker = None
+_reranker = False
 
 def _get_reranker():
-    global _reranker
-    if _reranker is not None:
-        return _reranker
-
-    enabled = os.getenv("RERANK_ENABLE", "false").lower() in ("1", "true", "yes")
-    if not enabled:
-        _reranker = False
-        return None
-
-    model_name = os.getenv("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
-    try:
-        from sentence_transformers import CrossEncoder
-        logger.info(f"Loading cross-encoder reranker: {model_name}")
-        _reranker = CrossEncoder(model_name)
-        return _reranker
-    except Exception as e:
-        logger.warning(f"Failed to load reranker ({model_name}): {e}")
-        _reranker = False
-        return None
+    return None
 
 
 def normalize_scores(results: list[dict], score_key: str = "score", reverse: bool = False) -> list[dict]:
@@ -60,6 +43,52 @@ def normalize_scores(results: list[dict], score_key: str = "score", reverse: boo
             
     return results
 
+
+def _rrf_fuse(
+    dense_results: list[dict],
+    sparse_results: list[dict],
+    alpha: float,
+    k: int,
+) -> list[dict]:
+    """
+    Reciprocal Rank Fusion with dense/sparse weighting.
+    This avoids brittle score calibration between BM25 and vector scores.
+    """
+    merged: dict[str, dict] = {}
+
+    for rank, doc in enumerate(dense_results, start=1):
+        cid = doc.get("chunk_id") or doc.get("metadata", {}).get("chunk_id", "")
+        if not cid:
+            continue
+        if cid not in merged:
+            merged[cid] = {
+                "doc": doc,
+                "dense_rrf": 0.0,
+                "sparse_rrf": 0.0,
+            }
+        merged[cid]["dense_rrf"] += 1.0 / (k + rank)
+
+    for rank, doc in enumerate(sparse_results, start=1):
+        cid = doc.get("chunk_id") or doc.get("metadata", {}).get("chunk_id", "")
+        if not cid:
+            continue
+        if cid not in merged:
+            merged[cid] = {
+                "doc": doc,
+                "dense_rrf": 0.0,
+                "sparse_rrf": 0.0,
+            }
+        merged[cid]["sparse_rrf"] += 1.0 / (k + rank)
+
+    fused = []
+    for data in merged.values():
+        doc = data["doc"]
+        doc["hybrid_score"] = (alpha * data["dense_rrf"]) + ((1.0 - alpha) * data["sparse_rrf"])
+        fused.append(doc)
+
+    fused.sort(key=lambda x: x.get("hybrid_score", 0.0), reverse=True)
+    return fused
+
 def retrieve(
     query         : str,
     content_domain: str = None,
@@ -82,14 +111,6 @@ def retrieve(
     else:
         search_query = query
 
-    # Step 1: Embed query
-    logger.info(f"Embedding query: '{search_query[:60]}'")
-    try:
-        query_vector = embed_query(search_query)
-    except Exception as e:
-        logger.error(f"Query embedding failed: {e}")
-        return []
-
     # Step 2: Build metadata filters
     filters = {}
     if content_domain and content_domain != "all":
@@ -102,61 +123,36 @@ def retrieve(
         filters["user_id"] = user_id
 
     # We fetch more chunks to ensure good overlap for hybrid scoring
-    fetch_k = max(top_k * 3, int(os.getenv("RETRIEVAL_FETCH_MULTIPLIER", "3")) * top_k)
+    fetch_k = max(top_k * 3, top_k + 5)
 
     # Step 3: Search ChromaDB (Vector/Dense)
     semantic_results = []
+    query_vector = []
+    logger.info(f"Embedding query: '{search_query[:60]}'")
     try:
-        semantic_results = search(query_vector=query_vector, filters=filters, top_k=fetch_k)
+        query_vector = embed_query(search_query)
+    except Exception as e:
+        logger.error(f"Query embedding failed, continuing with BM25 only: {e}")
+
+    try:
+        if query_vector:
+            semantic_results = search(query_vector=query_vector, filters=filters, top_k=fetch_k)
         semantic_results = normalize_scores(semantic_results, score_key="score", reverse=False)
     except Exception as e:
         logger.error(f"Vector search failed: {e}")
 
     # Step 4: Search BM25 (Keyword/Sparse)
-    keyword_results = search_bm25(search_query, top_k=fetch_k, user_id=user_id)
+    keyword_results = search_bm25(search_query, top_k=fetch_k, user_id=user_id) or []
     # BM25 returns score where higher is better
     keyword_results = normalize_scores(keyword_results, score_key="score", reverse=False)
 
-    # Step 5: Advanced Hybrid Weighting (Alpha Blending)
-    merged_map = {}
-    
-    # Map vector results
-    for res in semantic_results:
-        cid = res.get("chunk_id", res.get("metadata", {}).get("chunk_id", ""))
-        merged_map[cid] = {
-            "doc": res,
-            "vector_score": res.get("normalized_score", 0.0),
-            "bm25_score": 0.0
-        }
-        
-    # Map BM25 results
-    for res in keyword_results:
-        cid = res.get("chunk_id", res.get("metadata", {}).get("chunk_id", ""))
-        if cid in merged_map:
-            merged_map[cid]["bm25_score"] = res.get("normalized_score", 0.0)
-        else:
-            merged_map[cid] = {
-                "doc": res,
-                "vector_score": 0.0,
-                "bm25_score": res.get("normalized_score", 0.0)
-            }
-
-    # Calculate final hybrid score
-    unique_results = []
-    for cid, data in merged_map.items():
-        doc = data["doc"]
-        # Hybrid formula
-        doc["hybrid_score"] = (ALPHA * data["vector_score"]) + ((1.0 - ALPHA) * data["bm25_score"])
-        unique_results.append(doc)
-
-    # Sort down to combined top_k pool
-    unique_results.sort(key=lambda x: x["hybrid_score"], reverse=True)
+    # Step 5: Robust hybrid fusion (Weighted RRF)
+    unique_results = _rrf_fuse(semantic_results, keyword_results, ALPHA, RRF_K)
     if not unique_results:
         return []
 
     # Take the best candidates for Re-Ranking
-    candidate_mult = int(os.getenv("RERANK_CANDIDATE_MULTIPLIER", "2"))
-    candidates = unique_results[: max(top_k, top_k * candidate_mult)]
+    candidates = unique_results[:top_k * 2]
 
     # Step 6: Cross-Encoder Re-Ranking (Now optimally cached and scaled)
     reranker = _get_reranker()
@@ -195,23 +191,17 @@ def build_context_string(results: list[dict]) -> str:
         text    = r.get("text", "")
         # score could be hybrid_score or cross-encoder score
         score   = r.get("score", r.get("hybrid_score", 0))
-        section = meta.get("section_heading") or meta.get("section_title", "â€”")
+        section = meta.get("section_title", "â€”")
         source  = meta.get("source_url", "â€”")
         domain  = meta.get("content_domain", "â€”")
-        page    = meta.get("page_number", 0)
-        is_table = meta.get("is_table", 0)
-        ents    = meta.get("named_entities", "")
         cid     = r.get("chunk_id") or meta.get("chunk_id", "")
 
         context_parts.append(
             f"[Chunk {i}]\n"
             f"chunk_id: {cid}\n"
             f"Section : {section}\n"
-            f"Page    : {page}\n"
             f"Source  : {source}\n"
             f"Domain  : {domain}\n"
-            f"Table   : {is_table}\n"
-            f"Entities: {ents}\n"
             f"Score   : {score:.4f}\n"
             f"Text    : {text}\n"
         )

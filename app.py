@@ -1,13 +1,16 @@
 import streamlit as st
 import time
 import json
-import random
+import re
 import requests
 import os
 import uuid
 import pandas as pd
 
-API_URL = os.getenv("API_URL", "https://govlens-mdkg.onrender.com")
+API_URL = os.getenv("API_URL", "http://localhost:8000")
+HTTP_TIMEOUT_SEC = float(os.getenv("API_TIMEOUT_SEC", "60"))
+STREAM_CONNECT_TIMEOUT_SEC = float(os.getenv("API_STREAM_CONNECT_TIMEOUT_SEC", "20"))
+STREAM_READ_TIMEOUT_SEC = float(os.getenv("API_STREAM_READ_TIMEOUT_SEC", "300"))
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -513,6 +516,51 @@ hr { border-color: var(--glass-bdr) !important; margin: 12px 0 !important; }
 
 .col-label { color: rgba(255,255,255,0.40) !important; font-size: 11px !important; }
 .mono { font-family: 'JetBrains Mono', monospace; }
+
+/* ── Professional spacing + type hierarchy ── */
+.block-container {
+    padding-top: 1.1rem !important;
+    padding-bottom: 1.2rem !important;
+}
+h1, h2, h3 {
+    letter-spacing: -0.02em;
+}
+p, li {
+    line-height: 1.45;
+}
+
+/* ── KPI strip ── */
+.kpi-strip {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 10px;
+    margin: 4px 0 10px;
+}
+.kpi-card {
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-bdr);
+    border-radius: 12px;
+    padding: 12px 14px;
+    backdrop-filter: blur(10px);
+}
+.kpi-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.9px;
+    color: var(--text-sec);
+    margin-bottom: 4px;
+    font-family: 'JetBrains Mono', monospace;
+}
+.kpi-value {
+    font-size: 19px;
+    font-weight: 700;
+    color: var(--text-pri);
+}
+.kpi-sub {
+    margin-top: 2px;
+    font-size: 11px;
+    color: var(--text-ter);
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -534,6 +582,9 @@ if "active_domain" not in st.session_state:
     
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
+
+if "last_user_query" not in st.session_state:
+    st.session_state.last_user_query = ""
     
 if "docs" not in st.session_state:
     st.session_state.docs = []    
@@ -557,21 +608,10 @@ st.markdown(f"""
 
 # ── Functions ───────────────────────────────────────────────────────────────
 def get_badge_info(domain):
-    badge_map = {
-        "data_privacy"        : ("badge-teal",   "Data Privacy"),
-        "security"            : ("badge-blue",   "Security"),
-        "audit"               : ("badge-purple", "Audit"),
-        "risk_mgmt"           : ("badge-amber",  "Risk Mgmt"),
-        "hr_policy"           : ("badge-coral",  "HR Policy"),
-        # Generator valid domains
-        "board_governance"    : ("badge-blue",   "Board Governance"),
-        "risk_management"     : ("badge-amber",  "Risk Management"),
-        "audit_compliance"    : ("badge-purple", "Audit Compliance"),
-        "shareholder_rights"  : ("badge-teal",   "Shareholder Rights"),
-        "csr"                 : ("badge-coral",  "CSR"),
-        "financial_compliance": ("badge-amber",  "Financial Compliance"),
-    }
-    return badge_map.get(str(domain).lower(), ("badge-teal", str(domain).title().replace("_", " ")))
+    colors = ["badge-teal", "badge-blue", "badge-purple", "badge-amber", "badge-coral"]
+    d_str = str(domain).lower()
+    idx = sum(ord(c) for c in d_str) % len(colors)
+    return colors[idx], d_str.title().replace("_", " ")
 
 
 def checklist_rows_for_csv(checklist: list) -> tuple[list[dict], list[str]]:
@@ -620,6 +660,91 @@ def checklist_rows_for_csv(checklist: list) -> tuple[list[dict], list[str]]:
     return rows, cols
 
 
+def checklist_dataframe(checklist: list[dict]) -> pd.DataFrame:
+    rows = []
+    for i, r in enumerate(checklist, start=1):
+        rows.append({
+            "ID": r.get("id", f"{i:02d}"),
+            "Requirement": r.get("req") or r.get("item") or r.get("requirement") or "",
+            "Domain": r.get("domain", ""),
+            "Priority": r.get("priority", "Medium"),
+            "Action Type": r.get("action_type", "Process"),
+            "Source Section": r.get("source_section") or r.get("source") or "N/A",
+            "Evidence Required": r.get("evidence_required", ""),
+            "Chunk ID": r.get("chunk_id", ""),
+            "Retrieval Score": float(r.get("retrieval_score", 0.0) or 0.0),
+            "Done": bool(r.get("done", False)),
+        })
+    return pd.DataFrame(rows)
+
+
+def build_audit_report_markdown(checklist: list[dict], user_id: str) -> str:
+    total = len(checklist)
+    done = sum(1 for x in checklist if x.get("done", False))
+    completion = int((done / total) * 100) if total else 0
+    by_domain: dict[str, int] = {}
+    by_priority: dict[str, int] = {"High": 0, "Medium": 0, "Low": 0}
+    for item in checklist:
+        domain = str(item.get("domain", "unclassified"))
+        by_domain[domain] = by_domain.get(domain, 0) + 1
+        p = str(item.get("priority", "Medium")).capitalize()
+        if p not in by_priority:
+            by_priority[p] = 0
+        by_priority[p] += 1
+
+    lines = [
+        "# GovCheck Audit Report",
+        "",
+        "## Executive Summary",
+        f"- Session ID: `{user_id}`",
+        f"- Total checklist items: **{total}**",
+        f"- Items marked complete: **{done}**",
+        f"- Completion rate: **{completion}%**",
+        "",
+        "## Priority Distribution",
+        f"- High: {by_priority.get('High', 0)}",
+        f"- Medium: {by_priority.get('Medium', 0)}",
+        f"- Low: {by_priority.get('Low', 0)}",
+        "",
+        "## Domain Coverage",
+    ]
+    for domain, cnt in sorted(by_domain.items(), key=lambda x: x[1], reverse=True):
+        lines.append(f"- {domain}: {cnt}")
+    lines += ["", "## Detailed Checklist", ""]
+
+    for i, item in enumerate(checklist, start=1):
+        lines.extend([
+            f"### {i}. {item.get('item', item.get('req', 'Requirement'))}",
+            f"- Domain: {item.get('domain', 'N/A')}",
+            f"- Priority: {item.get('priority', 'Medium')}",
+            f"- Action Type: {item.get('action_type', 'Process')}",
+            f"- Source Section: {item.get('source_section', item.get('source', 'N/A'))}",
+            f"- Evidence Required: {item.get('evidence_required', 'N/A')}",
+            f"- Chunk ID: {item.get('chunk_id', 'N/A')}",
+            "",
+        ])
+    return "\n".join(lines)
+
+
+def api_post(path: str, **kwargs):
+    kwargs.setdefault("timeout", HTTP_TIMEOUT_SEC)
+    return requests.post(f"{API_URL}{path}", **kwargs)
+
+
+def api_get(path: str, **kwargs):
+    kwargs.setdefault("timeout", HTTP_TIMEOUT_SEC)
+    return requests.get(f"{API_URL}{path}", **kwargs)
+
+
+def _format_citations(text: str) -> str:
+    # Render [chunk_id:abc] as compact citation chips.
+    return re.sub(
+        r"\[chunk_id:([^\]]+)\]",
+        r"<span class='badge badge-blue'>chunk:\1</span>",
+        text,
+    )
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     sc1, sc2 = st.columns([4, 1])
@@ -661,12 +786,12 @@ with st.sidebar:
                     files = {"file": (uploaded.name, uploaded.getvalue(), uploaded.type)}
                     data = {"user_id": st.session_state["user_id"]}
                     st.session_state.doc_meta["name"] = uploaded.name
-                    res = requests.post(f"{API_URL}/api/upload", files=files, data=data)
+                    res = api_post("/api/upload", files=files, data=data)
                     st.session_state.docs.append((uploaded.name, uploaded.type, "uploaded"))
                 elif url_input:
                     data = {"link": url_input.strip(), "user_id": st.session_state["user_id"]}
                     st.session_state.doc_meta["name"] = str(url_input).split("/")[-1][:30] or "Cloud Document"
-                    res = requests.post(f"{API_URL}/api/upload", data=data)
+                    res = api_post("/api/upload", data=data)
                     st.session_state.docs.append((url_input, "URL", "link"))
                 
                 if res.status_code == 200:
@@ -679,7 +804,7 @@ with st.sidebar:
                     while not db_completed:
                         time.sleep(poll_ms)
                         try:
-                            status_res = requests.get(f"{API_URL}/api/status/{job_id}")
+                            status_res = api_get(f"/api/status/{job_id}")
                             if status_res.status_code != 200:
                                 poll_error = f"Status HTTP {status_res.status_code}"
                                 break
@@ -707,25 +832,13 @@ with st.sidebar:
                             "domain": "all",
                             "user_id": st.session_state["user_id"],
                         }
-                        chat_res = requests.post(f"{API_URL}/api/chat", json=payload_data)
+                        chat_res = api_post("/api/chat", json=payload_data)
                         if chat_res.status_code == 200:
                             payload = chat_res.json()
                             raw_data = payload.get("raw_data")
                             st.session_state.checklist = raw_data if raw_data is not None else []
-
-                            # Fallback for UI Mockup / API failure
                             if not st.session_state.checklist:
-                                import time as _time
-                                import json as _json
-                                import os as _os
-
-                                _time.sleep(0.5)
-                                sample_path = _os.path.join("data", "checklist-governance_policy_sample.json")
-                                if _os.path.exists(sample_path):
-                                    with open(sample_path, "r", encoding="utf-8") as jf:
-                                        st.session_state.checklist = _json.load(jf)
-                                else:
-                                    st.session_state.checklist = []
+                                st.warning("No checklist items were extracted from this source.")
 
                             st.session_state.doc_meta["reqs"] = len(st.session_state.checklist)
                             # Re-format checklist to match the new UI's expected format if needed
@@ -745,15 +858,8 @@ with st.sidebar:
                                         c.get("source_section", c.get("source", "N/A")),
                                     )
                         else:
-                            import json as _json
-                            import os as _os
-
-                            sample_path = _os.path.join("data", "checklist-governance_policy_sample.json")
-                            if _os.path.exists(sample_path):
-                                with open(sample_path, "r", encoding="utf-8") as jf:
-                                    st.session_state.checklist = _json.load(jf)
-                            else:
-                                st.session_state.checklist = []
+                            st.session_state.checklist = []
+                            st.error(f"Checklist extraction failed (HTTP {chat_res.status_code}).")
                 else:
                     st.error(f"Error {res.status_code}: {res.text}")
 
@@ -801,23 +907,10 @@ with st.sidebar:
         ("all",          "All domains",     "rgba(255,255,255,0.45)", dom_counts["all"]),
     ]
     
-    color_map = {
-        "data_privacy"        : "#0ff2c8",
-        "security"            : "#5b8ef0",
-        "risk_mgmt"           : "#f5c542",
-        "audit"               : "#c084fc",
-        "hr_policy"           : "#fb7185",
-        # Generator valid domains
-        "board_governance"    : "#5b8ef0",
-        "risk_management"     : "#f5c542",
-        "audit_compliance"    : "#c084fc",
-        "shareholder_rights"  : "#0ff2c8",
-        "csr"                 : "#fb7185",
-        "financial_compliance": "#f5c542",
-    }
+    hex_colors = ["#0ff2c8", "#5b8ef0", "#f5c542", "#c084fc", "#fb7185"]
     for d in all_domains:
         label = d.replace("_", " ").title()
-        color = color_map.get(d, "#0ff2c8")
+        color = hex_colors[sum(ord(c) for c in d) % len(hex_colors)]
         domains.append((d, label, color, dom_counts[d]))
 
     for key, label, color, count in domains:
@@ -849,17 +942,20 @@ with st.sidebar:
 done_count = sum(1 for item in st.session_state.checklist if item.get("done", False))
 total      = len(st.session_state.checklist)
 
-# Metrics
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    st.metric("Ingested docs", str(len(st.session_state.docs)), "Session active")
-with c2:
-    st.metric("Checklist items", str(total), f"{total} extracted")
-with c3:
-    pct = int(done_count / total * 100) if total > 0 else 0
-    st.metric("Completed", f"{done_count}/{total}", f"{pct}% compliance rate")
-with c4:
-    st.metric("Avg RAG score", "0.91", "Hybrid BM25+dense")
+pct = int(done_count / total * 100) if total > 0 else 0
+scores = [float(x.get("retrieval_score", 0.0) or 0.0) for x in st.session_state.checklist if str(x.get("retrieval_score", "")) != ""]
+avg_score = f"{(sum(scores) / max(1, len(scores))):.3f}" if scores else "N/A"
+st.markdown(
+    f"""
+    <div class="kpi-strip">
+      <div class="kpi-card"><div class="kpi-label">Ingested Docs</div><div class="kpi-value">{len(st.session_state.docs)}</div><div class="kpi-sub">Session scope</div></div>
+      <div class="kpi-card"><div class="kpi-label">Checklist Items</div><div class="kpi-value">{total}</div><div class="kpi-sub">Extracted controls</div></div>
+      <div class="kpi-card"><div class="kpi-label">Completion</div><div class="kpi-value">{done_count}/{total}</div><div class="kpi-sub">{pct}% marked complete</div></div>
+      <div class="kpi-card"><div class="kpi-label">Avg Retrieval Score</div><div class="kpi-value">{avg_score}</div><div class="kpi-sub">Hybrid dense+sparse</div></div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
@@ -889,65 +985,108 @@ with tab1:
         if has_data:
             pd.DataFrame(st.session_state.checklist).to_excel(buf, index=False, engine='openpyxl')
         st.download_button("⬇ Excel", data=buf.getvalue(), file_name="checklist.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True, disabled=not has_data, type="primary")
+    with ec4:
+        report_md = build_audit_report_markdown(st.session_state.checklist, st.session_state.user_id) if has_data else ""
+        st.download_button(
+            "⬇ Audit Report",
+            data=report_md,
+            file_name="audit_report.md",
+            mime="text/markdown",
+            use_container_width=True,
+            disabled=not has_data,
+            type="primary",
+            help="Executive-style audit summary and detailed checklist."
+        )
     with ec5:
         if st.button("⟳ Start Over", type="primary", use_container_width=True):
             st.session_state.clear()
             st.rerun()
 
-    # Table header
-    st.markdown("""
-    <div class="glass-card" style="padding:0;overflow:hidden;margin-bottom:0">
-      <div class="checklist-row header">
-        <span>#</span><span>Requirement</span><span>Domain</span><span>Red Team</span><span>Source</span>
-      </div>
-    """, unsafe_allow_html=True)
-
     filtered_checklist = [c for c in st.session_state.checklist if st.session_state.active_domain == "all" or c.get("domain") == st.session_state.active_domain]
+    sdf = checklist_dataframe(filtered_checklist)
+    sort_col1, sort_col2, sort_col3 = st.columns([2.0, 1.4, 1.2])
+    with sort_col1:
+        sort_by = st.selectbox(
+            "Sort by",
+            options=["Priority", "Retrieval Score", "Domain", "ID"],
+            index=0,
+            key="sort_by_table",
+        )
+    with sort_col2:
+        sort_order = st.selectbox(
+            "Order",
+            options=["Ascending", "Descending"],
+            index=0 if sort_by in {"Priority", "Domain", "ID"} else 1,
+            key="sort_order_table",
+        )
+    with sort_col3:
+        st.caption(f"{len(sdf)} rows")
 
-    for i, item in enumerate(filtered_checklist):
-        badge_cls, badge_txt = get_badge_info(item.get("domain", "general"))
-        try:
-            row_key = next(j for j, x in enumerate(st.session_state.checklist) if x is item)
-        except StopIteration:
-            row_key = i
+    if not sdf.empty:
+        if sort_by == "Priority":
+            priority_rank = {"High": 0, "Medium": 1, "Low": 2}
+            sdf["_priority_rank"] = sdf["Priority"].map(priority_rank).fillna(1)
+            sdf = sdf.sort_values(
+                by="_priority_rank",
+                ascending=(sort_order == "Ascending"),
+                kind="stable",
+            ).drop(columns=["_priority_rank"])
+        else:
+            sdf = sdf.sort_values(
+                by=sort_by,
+                ascending=(sort_order == "Ascending"),
+                kind="stable",
+            )
 
-        col_num, col_check, col_req, col_badge, col_rt, col_src = st.columns([0.4, 0.4, 3.8, 1.4, 1.4, 1.5])
-        with col_num:
-            st.markdown(f'<span class="mono" style="font-size:10px;color:rgba(255,255,255,0.25)">{item.get("id", i)}</span>', unsafe_allow_html=True)
-        with col_check:
-            checked = st.checkbox("", value=item.get("done", False), key=f"chk_row_{row_key}", label_visibility="collapsed")
-            # Real time state update
-            if checked != item.get("done", False):
-                item["done"] = checked
-                st.rerun()
-        with col_req:
-            opacity = "0.90" if checked else "0.55"
-            strike  = "line-through" if checked else "none"
-            st.markdown(f'<span style="font-size:12.5px;color:rgba(255,255,255,{opacity});text-decoration:{strike}">{item.get("req", "")}</span>', unsafe_allow_html=True)
-        with col_badge:
-            st.markdown(f'<span class="badge {badge_cls}">{badge_txt}</span>', unsafe_allow_html=True)
-        with col_src:
-            st.markdown(f'<span class="mono" style="font-size:10px;color:rgba(255,255,255,0.3)">{item.get("source", "N/A")}</span>', unsafe_allow_html=True)
-
-        st.markdown('<hr style="margin:0;border-color:rgba(255,255,255,0.05)">', unsafe_allow_html=True)
-
-    st.markdown("</div>", unsafe_allow_html=True)
+    st.dataframe(
+        sdf,
+        hide_index=True,
+        use_container_width=True,
+        height=480,
+        column_config={
+            "Requirement": st.column_config.TextColumn("Requirement", width="large"),
+            "Domain": st.column_config.TextColumn("Domain", width="medium"),
+            "Priority": st.column_config.TextColumn("Priority", width="small"),
+            "Action Type": st.column_config.TextColumn("Action Type", width="small"),
+            "Source Section": st.column_config.TextColumn("Source Section", width="medium"),
+            "Evidence Required": st.column_config.TextColumn("Evidence Required", width="large"),
+            "Chunk ID": st.column_config.TextColumn("Chunk ID", width="medium"),
+            "Retrieval Score": st.column_config.NumberColumn("Retrieval Score", format="%.4f"),
+            "Done": st.column_config.CheckboxColumn("Done"),
+        },
+    )
 
 # ── TAB 2: RAG Query ──────────────────────────────────────────────────────────
 with tab2:
     st.markdown('<div class="glass-card glass-card-teal">', unsafe_allow_html=True)
     st.markdown('<div style="font-size:11px;color:rgba(15,242,200,0.7);font-weight:600;letter-spacing:0.5px;margin-bottom:10px">HYBRID RAG INTERFACE</div>', unsafe_allow_html=True)
 
+    t1, t2 = st.columns([1.2, 1.2])
+    with t1:
+        if st.button("↻ Regenerate last response", use_container_width=True, disabled=not bool(st.session_state.last_user_query)):
+            if st.session_state.last_user_query:
+                st.session_state["chat_history"].append({"role": "user", "content": st.session_state.last_user_query})
+                st.rerun()
+    with t2:
+        if st.button("⟲ Retry last request", use_container_width=True, disabled=not bool(st.session_state.last_user_query)):
+            if st.session_state.last_user_query:
+                st.session_state["chat_history"].append({"role": "user", "content": st.session_state.last_user_query})
+                st.rerun()
+
     chat_container = st.container(height=350)
     with chat_container:
         for msg in st.session_state["chat_history"]:
             role_emoji = "👤" if msg["role"] == "user" else "🤖"
             role_color = "#8ab4f8" if msg["role"] == "user" else "#0ff2c8"
-            st.markdown(f'<div style="margin-bottom:14px;"><strong style="color:{role_color};">{role_emoji} {msg["role"].title()}</strong><div style="font-size:13px; color:rgba(255,255,255,0.8); margin-top:4px;">{msg["content"]}</div></div>', unsafe_allow_html=True)
+            content = str(msg.get("content", ""))
+            if msg["role"] == "assistant":
+                content = _format_citations(content)
+            st.markdown(f'<div style="margin-bottom:14px;"><strong style="color:{role_color};">{role_emoji} {msg["role"].title()}</strong><div style="font-size:13px; color:rgba(255,255,255,0.8); margin-top:4px;">{content}</div></div>', unsafe_allow_html=True)
 
     query = st.chat_input("Ask about the policies...")
 
     if query:
+        st.session_state.last_user_query = query
         st.session_state["chat_history"].append({"role": "user", "content": query})
         st.rerun()
 
@@ -956,12 +1095,23 @@ with tab2:
         query_text = st.session_state["chat_history"][-1]["content"]
         with chat_container:
             st.markdown(f'<div style="margin-bottom:8px;"><strong style="color:#0ff2c8;">🤖 Assistant</strong>', unsafe_allow_html=True)
-            payload_data = {"query": query_text, "domain": st.session_state["active_domain"], "user_id": st.session_state["user_id"]}
+            history_for_backend = st.session_state["chat_history"][:-1][-8:]
+            payload_data = {
+                "query": query_text,
+                "domain": st.session_state["active_domain"],
+                "user_id": st.session_state["user_id"],
+                "chat_history": history_for_backend,
+            }
             
             with st.spinner("Thinking..."):
                 try:
                     def stream_res():
-                        with requests.post(f"{API_URL}/api/chat/stream", json=payload_data, stream=True) as response:
+                        with requests.post(
+                            f"{API_URL}/api/chat/stream",
+                            json=payload_data,
+                            stream=True,
+                            timeout=(STREAM_CONNECT_TIMEOUT_SEC, STREAM_READ_TIMEOUT_SEC),
+                        ) as response:
                             if response.status_code == 200:
                                 for line in response.iter_content(chunk_size=1024, decode_unicode=True):
                                     if line:
@@ -969,6 +1119,8 @@ with tab2:
                             else:
                                 yield "Backend stream error."
                     reply = st.write_stream(stream_res())
+                    if "I cannot verify this from the provided documents." in str(reply):
+                        st.warning("Weak evidence detected: response could not be strongly verified from retrieved documents.")
                     st.session_state["chat_history"].append({"role": "assistant", "content": reply})
                     st.rerun()
                 except Exception as e:
@@ -980,50 +1132,85 @@ with tab2:
 
 # ── TAB 3: Analytics ──────────────────────────────────────────────────────────
 with tab3:
-    a1, a2 = st.columns(2)
+    if not st.session_state.checklist:
+        st.info("No analytics yet. Process a document to generate checklist insights.")
+    else:
+        adf = checklist_dataframe(st.session_state.checklist)
+        adf["Priority"] = adf["Priority"].fillna("Medium").astype(str).str.capitalize()
+        adf["Domain"] = adf["Domain"].fillna("unclassified").astype(str)
+        adf["Done"] = adf["Done"].astype(bool)
+        adf["Has Evidence"] = adf["Evidence Required"].fillna("").astype(str).str.strip().str.len() > 0
 
-    with a1:
-        st.markdown('<div class="glass-card glass-card-blue" style="height:220px">', unsafe_allow_html=True)
-        st.markdown('<div style="font-size:11px;font-weight:600;color:rgba(91,142,240,0.8);letter-spacing:0.5px;margin-bottom:12px">COMPLIANCE RATE BY DOMAIN</div>', unsafe_allow_html=True)
+        # Risk-weighted score (simple heuristic)
+        risk_w = {"High": 3, "Medium": 2, "Low": 1}
+        adf["Risk Weight"] = adf["Priority"].map(risk_w).fillna(2)
+        total_risk = float(adf["Risk Weight"].sum())
+        open_risk = float(adf.loc[~adf["Done"], "Risk Weight"].sum())
+        risk_reduction_pct = int(((total_risk - open_risk) / total_risk) * 100) if total_risk > 0 else 0
 
-        for d in list(set([x.get("domain", "general") for x in st.session_state.checklist])):
-            label = d.replace("_", " ").title()
-            colr = color_map.get(d, "#0ff2c8")
-            d_items = [x for x in st.session_state.checklist if x.get("domain", "general") == d]
-            d_done = len([x for x in d_items if x.get("done", False)])
-            d_tot = len(d_items)
-            pct_d = int(d_done / max(d_tot, 1) * 100)
-            
-            st.markdown(f"""
-            <div style="margin-bottom:10px">
-              <div style="display:flex;justify-content:space-between;font-size:11px;color:rgba(255,255,255,0.55);margin-bottom:4px">
-                <span>{label} ({d_done}/{d_tot})</span><span style="color:{colr};font-family:JetBrains Mono,monospace">{pct_d}%</span>
-              </div>
-              <div style="height:4px;background:rgba(255,255,255,0.08);border-radius:4px;overflow:hidden">
-                <div style="height:100%;width:{pct_d}%;background:{colr};border-radius:4px;box-shadow:0 0 6px {colr}55"></div>
-              </div>
-            </div>
-            """, unsafe_allow_html=True)
+        k1, k2, k3, k4 = st.columns(4)
+        with k1:
+            st.metric("Open Items", int((~adf["Done"]).sum()))
+        with k2:
+            st.metric("High Priority Open", int(((adf["Priority"] == "High") & (~adf["Done"])).sum()))
+        with k3:
+            st.metric("Evidence Coverage", f"{int(adf['Has Evidence'].mean() * 100)}%")
+        with k4:
+            st.metric("Risk Reduction", f"{risk_reduction_pct}%")
 
-        st.markdown("</div>", unsafe_allow_html=True)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("##### Priority Distribution")
+            pr = adf.groupby("Priority", as_index=False).size().rename(columns={"size": "Count"})
+            pr["Priority"] = pd.Categorical(pr["Priority"], categories=["High", "Medium", "Low"], ordered=True)
+            pr = pr.sort_values("Priority")
+            st.bar_chart(pr.set_index("Priority")["Count"], use_container_width=True)
 
-    with a2:
-        st.markdown('<div class="glass-card glass-card-purple" style="height:220px">', unsafe_allow_html=True)
-        st.markdown('<div style="font-size:11px;font-weight:600;color:rgba(192,132,252,0.8);letter-spacing:0.5px;margin-bottom:12px">PIPELINE PERFORMANCE</div>', unsafe_allow_html=True)
+        with c2:
+            st.markdown("##### Completion by Domain")
+            dom = (
+                adf.groupby("Domain", as_index=False)
+                .agg(total=("ID", "count"), completed=("Done", "sum"))
+            )
+            dom["Completion %"] = ((dom["completed"] / dom["total"]) * 100).round(1)
+            st.dataframe(
+                dom.sort_values("Completion %", ascending=False),
+                hide_index=True,
+                use_container_width=True,
+                height=250,
+            )
 
-        perf_items = [
-            ("Avg chunk tokens",     "312",   "#5b8ef0"),
-            ("Embedding latency",    "1.2s",  "#c084fc"),
-            ("BM25 index size",      "2.4 MB","#f5c542"),
-            ("LLM generation time",  "1.8s",  "#fb7185"),
+        st.markdown("##### Pending Critical Actions")
+        pending_critical = adf[(~adf["Done"]) & (adf["Priority"] == "High")][
+            ["ID", "Requirement", "Domain", "Source Section", "Chunk ID"]
         ]
-        for label, val, color in perf_items:
-            st.markdown(f"""
-            <div style="display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.05)">
-              <span style="font-size:11px;color:rgba(255,255,255,0.45)">{label}</span>
-              <span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:{color};font-weight:500">{val}</span>
-            </div>
-            """, unsafe_allow_html=True)
+        if pending_critical.empty:
+            st.success("No pending high-priority actions.")
+        else:
+            st.dataframe(
+                pending_critical,
+                hide_index=True,
+                use_container_width=True,
+                height=260,
+            )
 
-        st.markdown("</div>", unsafe_allow_html=True)
+        analytics_export = adf.copy()
+        analytics_export["Completion % by Domain"] = analytics_export["Domain"].map(
+            dict(
+                (d, v)
+                for d, v in (
+                    adf.groupby("Domain")
+                    .apply(lambda x: round(float(x["Done"].mean() * 100), 1))
+                    .to_dict()
+                    .items()
+                )
+            )
+        )
+        st.download_button(
+            "⬇ Export Analytics CSV",
+            data=analytics_export.to_csv(index=False).encode("utf-8"),
+            file_name="analytics_report.csv",
+            mime="text/csv",
+            use_container_width=False,
+        )
 

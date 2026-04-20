@@ -16,6 +16,9 @@ langchain
 langchain-text-splitters
 python-multipart
 groq
+picoclaw
+celery
+redis
 rank-bm25
 chromadb
 sentence-transformers

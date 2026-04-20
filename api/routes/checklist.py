@@ -17,15 +17,9 @@ class ChecklistItem(BaseModel):
     item: str
     domain: str
     source_section: str
-    page_number: Optional[int] = None
-    source_quote: Optional[str] = None
-    confidence: Optional[str] = None
     source_url: Optional[str] = None
     chunk_id: Optional[str] = None
     compliance_framework: Optional[str] = None
-    verified: Optional[bool] = None
-    verification_confidence: Optional[float] = None
-    verification_evidence: Optional[str] = None
 
 @router.post("/api/v1/checklist", response_model=List[ChecklistItem])
 async def checklist_endpoint(payload: ChecklistRequest):

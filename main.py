@@ -1,18 +1,17 @@
-from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 import os
 import uuid
-import logging
 from typing import Optional
+from celery.result import AsyncResult
 
-logger = logging.getLogger(__name__)
+from workers.celery_app import celery_app
+from workers.job_status import get_status as get_job_status, set_status
+from workers.tasks import run_ingestion_pipeline
 
 # Setup directories
-os.makedirs("frontend", exist_ok=True)
 os.makedirs("./output", exist_ok=True)
 
 app = FastAPI(title="Governance AI API", version="2.0")
@@ -28,17 +27,13 @@ app.add_middleware(
 
 import threading
 
-_model_ready = threading.Event()
-
 def _prewarm_model():
     try:
         print("Pre-warming embedding model (background thread)...")
         from embedding.embedder import get_model
         get_model()
-        _model_ready.set()
         print("Embedding model ready.")
     except Exception as e:
-        _model_ready.set()  # unblock even on failure; pipeline will surface the real error
         print(f"Warning: Model pre-warm failed: {e}")
 
 # Startup: Init db immediately; warm model in background so server starts fast
@@ -52,56 +47,14 @@ async def startup_event():
     t.start()
     print("Server ready. Model warming up in background...")
 
-# Status dictionary to track ingestion progress
-JOB_STATUS = {}
-
 class ChatRequest(BaseModel):
     query: str
     domain: Optional[str] = "all"
     user_id: Optional[str] = "anonymous"
-
-def run_ingestion_pipeline(file_path: str, filename: str, job_id: str, user_id: str = "anonymous"):
-    try:
-        JOB_STATUS[job_id] = {"status": "processing", "progress": 25, "message": "Extracting text..."}
-
-        # Ingestion router
-        from ingestion.router import route_file
-        blocks = route_file(file_path, "upload", "Unknown")
-
-        JOB_STATUS[job_id] = {"status": "processing", "progress": 50, "message": "Chunking text (semantic)..."}
-        from chunking.chunker import process_blocks
-        chunks = process_blocks(blocks)
-        
-        # Isolate by User
-        for c in chunks:
-            c["user_id"] = user_id
-
-        JOB_STATUS[job_id] = {"status": "processing", "progress": 75, "message": "Classifying & Embedding..."}
-        from classification.rule_classifier import classify_chunks
-        classified = classify_chunks(chunks)
-
-        # Build vector store and BM25 index for Hybrid RAG
-        from embedding.embedder import embed_chunks
-        from vectorstore.chroma_store import upsert_chunks
-        from retrieval.bm25_store import build_bm25_index
-
-        vectors = embed_chunks(classified)
-        upsert_chunks(classified, vectors)
-        build_bm25_index(classified, user_id)
-        JOB_STATUS[job_id] = {"status": "completed", "progress": 100, "message": f"Successfully ingested {len(classified)} chunks"}
-    except Exception as e:
-        import traceback
-        logger.error(f"Ingestion pipeline failed: {traceback.format_exc()}")
-        JOB_STATUS[job_id] = {"status": "error", "progress": 0, "message": str(e)}
-    finally:
-        # We don't remove the file here initially since it is needed by the background task
-        # It should be cleaned up at the end of the ingestion pipeline
-        pass
+    chat_history: Optional[list[dict]] = None
 
 @app.post("/api/upload")
-async def upload_file(background_tasks: BackgroundTasks, file: Optional[UploadFile] = File(None), link: Optional[str] = Form(None), user_id: str = Form("anonymous")):
-    if not _model_ready.is_set():
-        raise HTTPException(status_code=503, detail="Embedding model is still loading, please retry in a few seconds.")
+async def upload_file(file: Optional[UploadFile] = File(None), link: Optional[str] = Form(None), user_id: str = Form("anonymous")):
     job_id = str(uuid.uuid4())
     os.makedirs(f"output/{user_id}", exist_ok=True)
     
@@ -119,15 +72,26 @@ async def upload_file(background_tasks: BackgroundTasks, file: Optional[UploadFi
     else:
         raise HTTPException(status_code=400, detail="Must provide either a file or a link")
 
-    JOB_STATUS[job_id] = {"status": "queued", "progress": 0, "message": "Job queued"}
-    background_tasks.add_task(run_ingestion_pipeline, file_path, filename, job_id, user_id)
-    return {"job_id": job_id, "message": "Upload successful, processing in background"}
+    set_status(job_id, {"status": "queued", "progress": 0, "message": "Job queued"})
+    run_ingestion_pipeline.apply_async(args=[file_path, filename, job_id, user_id], task_id=job_id)
+    return {"job_id": job_id, "message": "Upload successful, queued for processing"}
 
 @app.get("/api/status/{job_id}")
 async def get_status(job_id: str):
-    if job_id not in JOB_STATUS:
+    status_payload = get_job_status(job_id)
+    if status_payload:
+        return status_payload
+
+    task_result = AsyncResult(job_id, app=celery_app)
+    if task_result.state == "PENDING":
         raise HTTPException(status_code=404, detail="Job not found")
-    return JOB_STATUS[job_id]
+    if task_result.state in {"RECEIVED", "STARTED"}:
+        return {"status": "processing", "progress": 10, "message": "Worker started processing task"}
+    if task_result.state == "SUCCESS":
+        return {"status": "completed", "progress": 100, "message": "Task completed"}
+    if task_result.state == "FAILURE":
+        return {"status": "error", "progress": 0, "message": str(task_result.result)}
+    return {"status": "queued", "progress": 0, "message": f"Task state: {task_result.state}"}
 
 @app.post("/api/chat")
 async def chat_endpoint(request: ChatRequest):
@@ -166,7 +130,7 @@ async def chat_endpoint(request: ChatRequest):
         return {"response": answer_string, "raw_data": checklist_items}
     else:
         # Otherwise, use standard Chat Q&A
-        answer_string = await run_in_threadpool(generate_answer, request.query, context_string)
+        answer_string = await run_in_threadpool(generate_answer, request.query, context_string, request.chat_history)
         return {"response": answer_string, "raw_data": None}
 
 @app.post("/api/chat/stream")
@@ -186,7 +150,7 @@ async def chat_endpoint_stream(request: ChatRequest):
         return StreamingResponse(mock_stream(), media_type="text/plain")
 
     # Use standard Chat Q&A via stream
-    generator = stream_answer(request.query, context_string)
+    generator = stream_answer(request.query, context_string, request.chat_history)
     
     async def generate():
         for chunk in generator:
@@ -194,10 +158,11 @@ async def chat_endpoint_stream(request: ChatRequest):
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
-# Mount the custom HTML UI
-#app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
+@app.get("/")
+async def root():
+    return {
+        "service": "GovCheck API",
+        "status": "ok",
+        "ui": "Streamlit-only mode. Start UI with: streamlit run app.py",
+    }
 
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)

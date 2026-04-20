@@ -19,19 +19,12 @@ def _get_client() -> Groq:
     return Groq(api_key=api_key)
 
 
-# ── Allowed domain labels ─────────────────────────────────────
-DOMAIN_LABELS = [
-    "board_governance",
-    "data_privacy",
-    "risk_management",
-    "audit_compliance",
-    "shareholder_rights",
-    "csr",
-    "hr_policy",
-    "financial_compliance",
-]
+from classification.rule_classifier import get_valid_domains
 
-DEFAULT_DOMAIN = "audit_compliance"
+# ── Allowed domain labels ─────────────────────────────────────
+DOMAIN_LABELS = get_valid_domains()
+
+DEFAULT_DOMAIN = os.getenv("CLASSIFY_DEFAULT_DOMAIN", "audit_compliance")
 
 # ── Cache: avoid repeated LLM calls for same section_title ────
 _cache: dict[str, str] = {}
