@@ -87,6 +87,7 @@ def load_pdf(
                 "document_title": document_title,
                 "organization"  : org_name,
                 "section_title" : f"Page {page_num}",
+                "page_number"   : page_num,
                 "section_level" : "",
                 "chapter"       : "",
                 "article"       : "",

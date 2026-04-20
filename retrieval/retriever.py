@@ -15,10 +15,28 @@ ALPHA = float(os.getenv("SEARCH_WEIGHT_ALPHA", "0.7"))
 
 # Cross-encoder re-ranking disabled — requires a separate model download
 # and blocks first query. Hybrid BM25+vector scoring is sufficient.
-_reranker = False
+_reranker = None
 
 def _get_reranker():
-    return None
+    global _reranker
+    if _reranker is not None:
+        return _reranker
+
+    enabled = os.getenv("RERANK_ENABLE", "false").lower() in ("1", "true", "yes")
+    if not enabled:
+        _reranker = False
+        return None
+
+    model_name = os.getenv("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+    try:
+        from sentence_transformers import CrossEncoder
+        logger.info(f"Loading cross-encoder reranker: {model_name}")
+        _reranker = CrossEncoder(model_name)
+        return _reranker
+    except Exception as e:
+        logger.warning(f"Failed to load reranker ({model_name}): {e}")
+        _reranker = False
+        return None
 
 
 def normalize_scores(results: list[dict], score_key: str = "score", reverse: bool = False) -> list[dict]:
@@ -84,7 +102,7 @@ def retrieve(
         filters["user_id"] = user_id
 
     # We fetch more chunks to ensure good overlap for hybrid scoring
-    fetch_k = top_k * 3
+    fetch_k = max(top_k * 3, int(os.getenv("RETRIEVAL_FETCH_MULTIPLIER", "3")) * top_k)
 
     # Step 3: Search ChromaDB (Vector/Dense)
     semantic_results = []
@@ -137,7 +155,8 @@ def retrieve(
         return []
 
     # Take the best candidates for Re-Ranking
-    candidates = unique_results[:top_k * 2]
+    candidate_mult = int(os.getenv("RERANK_CANDIDATE_MULTIPLIER", "2"))
+    candidates = unique_results[: max(top_k, top_k * candidate_mult)]
 
     # Step 6: Cross-Encoder Re-Ranking (Now optimally cached and scaled)
     reranker = _get_reranker()
@@ -176,17 +195,23 @@ def build_context_string(results: list[dict]) -> str:
         text    = r.get("text", "")
         # score could be hybrid_score or cross-encoder score
         score   = r.get("score", r.get("hybrid_score", 0))
-        section = meta.get("section_title", "â€”")
+        section = meta.get("section_heading") or meta.get("section_title", "â€”")
         source  = meta.get("source_url", "â€”")
         domain  = meta.get("content_domain", "â€”")
+        page    = meta.get("page_number", 0)
+        is_table = meta.get("is_table", 0)
+        ents    = meta.get("named_entities", "")
         cid     = r.get("chunk_id") or meta.get("chunk_id", "")
 
         context_parts.append(
             f"[Chunk {i}]\n"
             f"chunk_id: {cid}\n"
             f"Section : {section}\n"
+            f"Page    : {page}\n"
             f"Source  : {source}\n"
             f"Domain  : {domain}\n"
+            f"Table   : {is_table}\n"
+            f"Entities: {ents}\n"
             f"Score   : {score:.4f}\n"
             f"Text    : {text}\n"
         )

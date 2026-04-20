@@ -85,6 +85,7 @@ def upsert_chunks(
             "document_title"      : str(chunk.get("document_title","")       or ""),
             "organization"        : str(chunk.get("organization","")         or ""),
             "section_title"       : str(chunk.get("section_title","")        or ""),
+            "section_heading"     : str(chunk.get("section_heading","")      or ""),
             "section_level"       : str(chunk.get("section_level","")        or ""),
             "chapter"             : str(chunk.get("chapter","")              or ""),
             "article"             : str(chunk.get("article","")              or ""),
@@ -93,6 +94,9 @@ def upsert_chunks(
             "document_type"       : str(chunk.get("document_type","")        or ""),
             "content_domain"      : str(chunk.get("content_domain","")       or "unclassified"),
             "compliance_framework": str(chunk.get("compliance_framework","") or "unknown"),
+            "page_number"         : int(chunk.get("page_number",0)           or 0),
+            "is_table"            : int(chunk.get("is_table",0)              or 0),
+            "named_entities"      : str(chunk.get("named_entities","")       or ""),
             "token_count"         : int(chunk.get("token_count",0)           or 0),
             "chunk_index"         : int(chunk.get("chunk_index",0)           or 0),
         }
