@@ -2,30 +2,21 @@ import hashlib
 import logging
 import json
 import os
+import re
+import numpy as np
 from dotenv import load_dotenv
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from chunking.token_utils import count_tokens, tiktoken_length
+from chunking.token_utils import count_tokens
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "./output")
 
-# multilingual-e5-* uses max ~512 tokens; larger chunks are truncated in the embedder.
 MAX_TOKENS = int(os.getenv("CHUNK_MAX_TOKENS", "512"))
-OVERLAP = int(os.getenv("CHUNK_OVERLAP", "64"))
-if OVERLAP >= MAX_TOKENS:
-    OVERLAP = max(0, MAX_TOKENS // 8)
-SEPARATORS = ["\n\n", "\n", ".", "!", "?", " ", ""]
+# Cosine similarity drop threshold to detect a semantic boundary (0–1; lower = more splits)
+SEMANTIC_THRESHOLD = float(os.getenv("SEMANTIC_THRESHOLD", "0.3"))
 
 
-def _get_splitter() -> RecursiveCharacterTextSplitter:
-    return RecursiveCharacterTextSplitter(
-        chunk_size       = MAX_TOKENS,
-        chunk_overlap    = OVERLAP,
-        length_function  = tiktoken_length,
-        separators       = SEPARATORS,
-    )
 
 def _save_chunks(chunks: list[dict]) -> None:
     if os.getenv("SAVE_CHUNK_JSONL", "false").lower() not in ("1", "true", "yes"):
@@ -52,58 +43,73 @@ def _build_chunk(text: str, base_block: dict, chunk_index: int, source_format: s
     chunk["source_format"] = source_format
     return chunk
 
+def _split_sentences(text: str) -> list[str]:
+    """Split text into sentences on '.', '!', '?' followed by whitespace."""
+    parts = re.split(r'(?<=[.!?])\s+', text.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
 def _semantic_chunking(blocks: list[dict], source_format: str) -> list[dict]:
     """
-    Merge small ingestion blocks up to MAX_TOKENS, then split with overlap.
-    Uses the same token counter as the splitter so boundaries stay consistent.
-    Joins blocks with newlines only (no extra spaces) to preserve source wording.
+    True semantic chunking: embed every sentence, detect topic-shift breakpoints
+    via cosine-similarity drops, then group sentences into token-bounded chunks.
     """
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=MAX_TOKENS,
-        chunk_overlap=OVERLAP,
-        length_function=tiktoken_length,
-        separators=SEPARATORS,
-    )
-    all_chunks = []
-    chunk_index = 0
+    from embedding.embedder import get_model
 
-    buffer_text = ""
-    buffer_block = blocks[0] if blocks else {}
-
+    # 1. Collect all sentences with their originating block
+    sentences, sent_blocks = [], []
     for block in blocks:
         text = block.get("text", "").strip()
         if not text:
             continue
+        for s in _split_sentences(text):
+            sentences.append(s)
+            sent_blocks.append(block)
 
-        combined = f"{buffer_text}\n\n{text}" if buffer_text else text
+    if not sentences:
+        return []
 
-        if count_tokens(combined) > MAX_TOKENS:
-            if buffer_text.strip():
-                try:
-                    sub_texts = splitter.split_text(buffer_text)
-                except Exception:
-                    sub_texts = [buffer_text]
-                
-                for sub in sub_texts:
-                    if sub.strip():
-                        all_chunks.append(_build_chunk(sub, buffer_block, chunk_index, source_format))
-                        chunk_index += 1
-            buffer_text = text
-            buffer_block = block
+    # 2. Embed all sentences (reuse the already-loaded model)
+    model = get_model()
+    vecs = model.encode(
+        ["passage: " + s for s in sentences],
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+        show_progress_bar=False,
+    )  # shape: (N, dim)
+
+    # 3. Compute cosine similarity between consecutive sentences
+    #    (vectors are already L2-normalised, so dot product == cosine sim)
+    similarities = [
+        float(np.dot(vecs[i], vecs[i + 1])) for i in range(len(vecs) - 1)
+    ]
+
+    # 4. Group sentences into chunks: start a new chunk when similarity drops
+    #    below threshold OR the current group would exceed MAX_TOKENS.
+    all_chunks, chunk_index = [], 0
+    group, group_block = [sentences[0]], sent_blocks[0]
+
+    def _flush(group, group_block):
+        nonlocal chunk_index
+        text = " ".join(group)
+        all_chunks.append(_build_chunk(text, group_block, chunk_index, source_format))
+        chunk_index += 1
+
+    for i, sim in enumerate(similarities):
+        next_sent = sentences[i + 1]
+        candidate = " ".join(group + [next_sent])
+        is_boundary = sim < (1.0 - SEMANTIC_THRESHOLD)
+        over_budget = count_tokens(candidate) > MAX_TOKENS
+
+        if is_boundary or over_budget:
+            _flush(group, group_block)
+            group = [next_sent]
+            group_block = sent_blocks[i + 1]
         else:
-            buffer_text = combined
+            group.append(next_sent)
 
-    # Flush the remaining semantic buffer safely
-    if buffer_text.strip():
-        try:
-            sub_texts = splitter.split_text(buffer_text)
-        except Exception:
-            sub_texts = [buffer_text]
-            
-        for sub in sub_texts:
-            if sub.strip():
-                all_chunks.append(_build_chunk(sub, buffer_block, chunk_index, source_format))
-                chunk_index += 1
+    if group:
+        _flush(group, group_block)
 
     return all_chunks
 

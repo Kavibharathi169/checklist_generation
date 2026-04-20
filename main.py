@@ -6,7 +6,10 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 import os
 import uuid
+import logging
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 # Setup directories
 os.makedirs("frontend", exist_ok=True)
@@ -25,13 +28,17 @@ app.add_middleware(
 
 import threading
 
+_model_ready = threading.Event()
+
 def _prewarm_model():
     try:
         print("Pre-warming embedding model (background thread)...")
         from embedding.embedder import get_model
         get_model()
+        _model_ready.set()
         print("Embedding model ready.")
     except Exception as e:
+        _model_ready.set()  # unblock even on failure; pipeline will surface the real error
         print(f"Warning: Model pre-warm failed: {e}")
 
 # Startup: Init db immediately; warm model in background so server starts fast
@@ -61,7 +68,7 @@ def run_ingestion_pipeline(file_path: str, filename: str, job_id: str, user_id: 
         from ingestion.router import route_file
         blocks = route_file(file_path, "upload", "Unknown")
 
-        JOB_STATUS[job_id] = {"status": "processing", "progress": 50, "message": "Chunking text..."}
+        JOB_STATUS[job_id] = {"status": "processing", "progress": 50, "message": "Chunking text (semantic)..."}
         from chunking.chunker import process_blocks
         chunks = process_blocks(blocks)
         
@@ -83,6 +90,8 @@ def run_ingestion_pipeline(file_path: str, filename: str, job_id: str, user_id: 
         build_bm25_index(classified, user_id)
         JOB_STATUS[job_id] = {"status": "completed", "progress": 100, "message": f"Successfully ingested {len(classified)} chunks"}
     except Exception as e:
+        import traceback
+        logger.error(f"Ingestion pipeline failed: {traceback.format_exc()}")
         JOB_STATUS[job_id] = {"status": "error", "progress": 0, "message": str(e)}
     finally:
         # We don't remove the file here initially since it is needed by the background task
@@ -91,6 +100,8 @@ def run_ingestion_pipeline(file_path: str, filename: str, job_id: str, user_id: 
 
 @app.post("/api/upload")
 async def upload_file(background_tasks: BackgroundTasks, file: Optional[UploadFile] = File(None), link: Optional[str] = Form(None), user_id: str = Form("anonymous")):
+    if not _model_ready.is_set():
+        raise HTTPException(status_code=503, detail="Embedding model is still loading, please retry in a few seconds.")
     job_id = str(uuid.uuid4())
     os.makedirs(f"output/{user_id}", exist_ok=True)
     
